@@ -39,27 +39,55 @@ python wsgi.py            # 开发服务器，监听 0.0.0.0:5000
 
 | 页面 | 功能 |
 | --- | --- |
-| `/` | 采样单总览：有效/总报告数、采信的两个报告号、待补标记、重核状态 |
+| `/` | 采样单总览：**每页最多 50 单、待补在前、组内按单号**；保留有效/总报告数、采信的两个报告号、待补标记、重核状态等原各列；页首保留四项全库统计 |
 | `/forms/import` | 导入应复核单号（文本框逐行粘贴） |
 | `/reports/upload` | 上传 CSV 文件或粘贴 CSV 文本，展示入档/拒收明细 |
 | `/forms/<单号>` | 单详情：全部报告（含已作废）、配对历史、重核记录 |
 | `/batches` | 质控批一览、整批作废操作、当前重核待补名单 |
 | `/rechecks` | 重核待补名单（重核期间照常可查） |
 
+### 总览分页与一致性设计
+
+- **键集分页（keyset paging），不用 OFFSET**：`forms.pending` 物化“是否待补”，复合索引
+  `idx_forms_pending(pending DESC, form_id ASC)` 直接支撑排序；翻页只按上一页边界游标
+  `(pending, form_id)` 做索引定位，取 51 条留 1 条判断是否还有下一页。查一页不遍历全库，
+  翻到深页也不扫过前面的单（`EXPLAIN QUERY PLAN` 为 `SCAN f USING INDEX idx_forms_pending`，无临时排序表）。
+- **页首统计不逐单重算**：单行表 `overview_meta` 的四项统计由触发器随业务事务增量维护，
+  页首 O(1) 读取；统计与当页明细在**同一只读事务（同一已提交快照）**内取出，二者口径一致。
+- **翻页版本 `pagination_epoch`**：仅在“新单入册”或“有单进入/退出待补（待补集合净变化）”时
+  在写入事务内 +1；只换报告号、只改报告计数而未进出待补时不推进。翻页链接携带取页时的 epoch，
+  若与当前不一致，总览页不沿旧位置取数，而是**提示回首页**；版本未变则照常翻页。
+- **提交即反映、失败不改总览**：名单导入、报告续传、整批作废均在事务内同步 `pending`、统计与
+  epoch，提交后下一次总览读取立即看到新状态；失败整体回滚，总览统计与版本不变。
+- **旧库直接升级**：启动时检测旧版 `forms` 表（无 `pending` 列），自动 `ALTER TABLE` 补列并按
+  当前生效配对回填待补标记、校准统计，迁移幂等，数据不丢。
+
+### 在 Docker 总览页演示翻页
+
+```bash
+docker compose up --build
+# 灌入 130 单（其中 40 单已采信、90 单待补），总览即出现 3 页
+docker compose exec qc-review python scripts/seed_demo_paging.py
+# 浏览器打开 http://localhost:5000 ，用“下一页 / 上一页”翻页（脚本幂等，可重复执行）
+```
+
+
 ## 数据模型（SQLite）
 
-- `forms` 应复核名单；`batches` 质控批号（含作废时间）；
+- `forms` 应复核名单（含物化待补标记 `pending` 与分页索引 `idx_forms_pending`）；
+  `batches` 质控批号（含作废时间）；
 - `reports` 报告（`valid` 标记有效性，作废只置失效、不删数据，保留审计痕迹）；
 - `pairings` 配对记录（生效配对每单至多一条，解体记录保留原因）；
-- `batch_invalidations` 作废事件；`recheck_entries` 重核名单及核销状态。
+- `batch_invalidations` 作废事件；`recheck_entries` 重核名单及核销状态；
+- `overview_meta` 单行元数据：触发器维护的四项全库统计与翻页版本 `pagination_epoch`。
 
 ## 测试与试跑
 
 ```bash
-# 单元 + 网页端到端测试（9 个用例，标准库 unittest，无需额外依赖）
+# 单元 + 网页端到端测试（28 个用例，标准库 unittest，无需额外依赖）
 python3 -m unittest discover -s tests -v
 
-# 两个需求场景的完整试跑（作废换证、交错入档），打印每一步状态快照
+# 三个需求场景的完整试跑（作废换证、交错入档、总览分页），打印每一步状态快照
 python3 scripts/demo_scenarios.py
 ```
 
@@ -73,17 +101,30 @@ python3 scripts/demo_scenarios.py
 - 按质控批整批作废的单事务处理：仅重核涉及单、有效配对保留、失效配对幸存者优先重建；
 - 失败不作废（回滚）、成功后拒收该批新报告；
 - 重核期间交错入档：名单查询不中断、其他批报告正常入档配对、补齐自动核销；
+- **总览键集分页：每页最多 50 单、待补在前组内按单号，单页走索引不遍历全库、深页无 OFFSET；**
+- **页首统计由触发器增量维护、O(1) 读取，与当页明细同一已提交快照；**
+- **翻页版本控制：新单入册或待补净变化才失效旧页码并提示回首页，只换证/改计数照常翻页；**
+- **旧库在线迁移（补 `pending` 列、回填待补、校准统计），幂等可重复启动；**
 - Dockerfile + docker-compose.yml（命名卷持久化、健康检查、gunicorn 单 worker 多线程）。
 
 ## 实测结果
 
-- `python3 -m unittest discover -s tests`：**9/9 通过**，覆盖配对规则、拒收规则、作废回滚、幸存者重建、交错入档、HTTP 全流程；
-- `scripts/demo_scenarios.py`：两个场景试跑全部通过，输出可见作废后待补、幸存者保留（如 `R102-2 + R102-3`）、作废批报告拒收、补齐核销全过程；
-- 真实 Flask 服务冒烟：导入/上传/配对展示/作废/重核页/详情页 HTTP 均正常，作废成功与失败提示均正确呈现。
+- `python3 -m unittest discover -s tests`：**28/28 通过**，覆盖配对/拒收/作废回滚/幸存者重建/
+  交错入档/HTTP 全流程，以及分页顺序与页容、键集跨组、回翻、查询计划走索引、统计口径、
+  epoch 推进规则、旧库迁移、并发读快照、网页翻页链接与失效提示；
+- `scripts/demo_scenarios.py`：三个场景试跑全部通过，输出可见作废后待补、幸存者保留、
+  作废批拒收、补齐核销，以及总览 3 页键集翻页（含待补→已采信跨组页）与 epoch 失效全过程；
+- 真实 gunicorn（与 Dockerfile 同一启动命令）冒烟：导入 130 单后首页/下一页 HTTP 正常，
+  分页链接与统计卡片正确呈现；SQLite 只读事务快照在另一连接并发提交时保持稳定。
 
 ## 未完成 / 已知限制
 
-- 交付环境未安装 Docker，`docker compose up` 未能在本机实际执行；Dockerfile 与 compose 配置已按规范写好，需在有 Docker 的环境验证（镜像基于 `python:3.11-slim`，仅依赖 Flask/gunicorn）。
+- 交付环境未安装 Docker 守护进程，`docker compose up --build` 无法在本机实际拉起容器；
+  Dockerfile/compose 已按规范写好且镜像内启动命令（gunicorn）已在本机等价验证，
+  需在有 Docker 的环境执行一次构建确认；
 - 无登录鉴权与操作权限控制，适合内网受控部署；生产使用需在反向代理层加认证，并修改 `SECRET_KEY`。
-- 未做并发压力测试；SQLite 采用单 worker + 多线程 + 事务/`busy_timeout` 保证一致性，高并发写入场景建议换 PostgreSQL。
+- 未做高并发压力测试；SQLite 采用单 worker + 多线程 + 事务/`busy_timeout` 保证一致性，
+  高并发写入场景建议换 PostgreSQL。
 - CSV 仅支持五列固定结构（表头别名可扩展），暂不支持 Excel 直接导入。
+- 翻页基于键集游标而非连续页码数字：URL 中的 `pg` 仅用于页面显示“第几页”，深页定位完全由
+  游标索引完成；失效场景按需求回首页重新查看，不尝试在旧位置自动重定位。

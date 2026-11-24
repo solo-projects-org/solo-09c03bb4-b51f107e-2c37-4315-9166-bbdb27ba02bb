@@ -3,10 +3,15 @@ PRAGMA journal_mode = WAL;
 PRAGMA foreign_keys = ON;
 
 -- 应复核采样单名单
+-- pending：是否待补（无生效配对即 1），物化为列以支持键集分页与索引排序；
+-- 由服务层在配对/解体的同一事务内维护，触发器同步全库统计。
 CREATE TABLE IF NOT EXISTS forms (
     form_id        TEXT PRIMARY KEY,
-    created_at     TEXT NOT NULL DEFAULT (datetime('now', 'localtime'))
+    created_at     TEXT NOT NULL DEFAULT (datetime('now', 'localtime')),
+    pending        INTEGER NOT NULL DEFAULT 1 CHECK (pending IN (0, 1))
 );
+-- 总览排序：待补在前（pending DESC），组内按单号（form_id ASC）
+CREATE INDEX IF NOT EXISTS idx_forms_pending ON forms(pending DESC, form_id ASC);
 
 -- 质控批号
 CREATE TABLE IF NOT EXISTS batches (
@@ -71,3 +76,71 @@ CREATE TABLE IF NOT EXISTS recheck_entries (
     FOREIGN KEY (batch_id) REFERENCES batches(batch_id)
 );
 CREATE INDEX IF NOT EXISTS idx_recheck_open ON recheck_entries(status, form_id);
+CREATE INDEX IF NOT EXISTS idx_recheck_form ON recheck_entries(form_id, status);
+
+-- 总览全库统计与翻页版本号（单行表）：
+-- 四项统计由触发器随业务事务增量维护，页首读取为 O(1)，不逐单重算；
+-- pagination_epoch 仅在“新单入册”或“待补集合发生净变化”时由服务层 +1，
+-- 只换证、只改报告计数不推进，深页链接据此判断是否需要回首页。
+CREATE TABLE IF NOT EXISTS overview_meta (
+    id               INTEGER PRIMARY KEY CHECK (id = 1),
+    total_forms      INTEGER NOT NULL DEFAULT 0,
+    paired_forms     INTEGER NOT NULL DEFAULT 0,
+    pending_forms    INTEGER NOT NULL DEFAULT 0,
+    open_rechecks    INTEGER NOT NULL DEFAULT 0,
+    pagination_epoch INTEGER NOT NULL DEFAULT 0
+);
+INSERT OR IGNORE INTO overview_meta (id) VALUES (1);
+
+-- ---- 统计触发器：随写入事务提交/回滚，保证与业务数据同一状态 ----
+CREATE TRIGGER IF NOT EXISTS trg_forms_ai AFTER INSERT ON forms
+BEGIN
+    UPDATE overview_meta
+       SET total_forms = total_forms + 1,
+           pending_forms = pending_forms + NEW.pending
+     WHERE id = 1;
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_forms_au AFTER UPDATE OF pending ON forms
+BEGIN
+    UPDATE overview_meta
+       SET pending_forms = pending_forms
+           + CASE WHEN OLD.pending = 1 AND NEW.pending = 0 THEN -1
+                  WHEN OLD.pending = 0 AND NEW.pending = 1 THEN 1
+                  ELSE 0 END
+     WHERE id = 1;
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_pairings_ai AFTER INSERT ON pairings
+BEGIN
+    UPDATE overview_meta
+       SET paired_forms = paired_forms + 1
+     WHERE id = 1 AND NEW.dissolved_at IS NULL;
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_pairings_au AFTER UPDATE ON pairings
+BEGIN
+    UPDATE overview_meta
+       SET paired_forms = paired_forms
+           + CASE WHEN OLD.dissolved_at IS NULL AND NEW.dissolved_at IS NOT NULL THEN -1
+                  WHEN OLD.dissolved_at IS NOT NULL AND NEW.dissolved_at IS NULL THEN 1
+                  ELSE 0 END
+     WHERE id = 1;
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_recheck_ai AFTER INSERT ON recheck_entries
+BEGIN
+    UPDATE overview_meta
+       SET open_rechecks = open_rechecks + 1
+     WHERE id = 1 AND NEW.status = 'open';
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_recheck_au AFTER UPDATE ON recheck_entries
+BEGIN
+    UPDATE overview_meta
+       SET open_rechecks = open_rechecks
+           + CASE WHEN OLD.status = 'open' AND NEW.status <> 'open' THEN -1
+                  WHEN OLD.status <> 'open' AND NEW.status = 'open' THEN 1
+                  ELSE 0 END
+     WHERE id = 1;
+END;

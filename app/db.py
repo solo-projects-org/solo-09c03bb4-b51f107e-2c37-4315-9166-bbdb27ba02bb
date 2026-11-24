@@ -1,4 +1,4 @@
-"""SQLite 连接与初始化。"""
+"""SQLite 连接与初始化（含旧库在线升级）。"""
 import os
 import sqlite3
 
@@ -28,13 +28,61 @@ def close_db(exc=None) -> None:
         conn.close()
 
 
+def _table_columns(conn: sqlite3.Connection, table: str) -> set[str]:
+    return {row["name"] for row in conn.execute(
+        f"PRAGMA table_info({table})"
+    ).fetchall()}
+
+
+def _is_legacy_db(conn: sqlite3.Connection) -> bool:
+    """旧库：已有 forms 表，但缺少分页所需的 pending 物化列。"""
+    has_forms = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='forms'"
+    ).fetchone()
+    if has_forms is None:
+        return False
+    return "pending" not in _table_columns(conn, "forms")
+
+
 def init_db(app: Flask) -> None:
-    """按 schema.sql 建表（已存在则跳过）。"""
+    """建表 / 升级（已存在则跳过或迁移），全程幂等，旧库可直接启动升级。"""
     conn = sqlite3.connect(app.config["DB_PATH"])
     try:
+        conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA journal_mode = WAL")
+        conn.execute("PRAGMA foreign_keys = ON")
+
+        legacy = _is_legacy_db(conn)
+        if legacy:
+            # 先补列并按“是否存在生效配对”回填待补标记；
+            # 此时新触发器尚未创建，回填不会污染统计初值。
+            conn.execute(
+                "ALTER TABLE forms ADD COLUMN pending "
+                "INTEGER NOT NULL DEFAULT 1 CHECK (pending IN (0, 1))"
+            )
+            conn.execute(
+                "UPDATE forms SET pending = 0 "
+                "WHERE form_id IN ("
+                "    SELECT form_id FROM pairings WHERE dissolved_at IS NULL)"
+            )
+
         with open(SCHEMA_PATH, "r", encoding="utf-8") as f:
             conn.executescript(f.read())
+
+        if legacy:
+            # 旧库已有业务数据：按当前状态一次性校准四项全库统计与索引
+            conn.execute(
+                """
+                UPDATE overview_meta SET
+                    total_forms   = (SELECT COUNT(*) FROM forms),
+                    paired_forms  = (SELECT COUNT(*) FROM pairings
+                                      WHERE dissolved_at IS NULL),
+                    pending_forms = (SELECT COUNT(*) FROM forms WHERE pending = 1),
+                    open_rechecks = (SELECT COUNT(*) FROM recheck_entries
+                                      WHERE status = 'open')
+                WHERE id = 1
+                """
+            )
         conn.commit()
     finally:
         conn.close()

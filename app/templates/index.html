@@ -9,6 +9,28 @@
   <div class="card danger"><b>{{ stats.open_rechecks }}</b><span>重核中</span></div>
 </section>
 
+{% if stale %}
+<div class="flash warning stale-notice">
+  <b>总览数据已变化</b>：自您翻到本页起，有新采样单入册，或有单进入/退出待补，
+  旧页码位置已失效。为避免漏单或错位，请
+  <a class="stale-home" href="{{ url_for('main.index') }}">回到首页重新查看（待补单在最前）</a>。
+</div>
+{% else %}
+<div class="pager-bar muted">
+  <span>第 {{ page_no }} 页 · 每页最多 {{ page_size }} 单 · 待补在前，组内按单号排序</span>
+  <span class="pager-links">
+    {% if has_prev and prev_cursor %}
+    <a href="{{ url_for('main.index', dir='prev', pg=page_no-1,
+        c_pending=prev_cursor.pending, c_form=prev_cursor.form, epoch=epoch) }}">← 上一页</a>
+    {% else %}<span class="pager-disabled">← 上一页</span>{% endif %}
+    <a href="{{ url_for('main.index') }}">回首页</a>
+    {% if has_next and next_cursor %}
+    <a href="{{ url_for('main.index', dir='next', pg=page_no+1,
+        c_pending=next_cursor.pending, c_form=next_cursor.form, epoch=epoch) }}">下一页 →</a>
+    {% else %}<span class="pager-disabled">下一页 →</span>{% endif %}
+  </span>
+</div>
+
 <table>
   <thead>
   <tr>
@@ -47,4 +69,20 @@
   {% endfor %}
   </tbody>
 </table>
+
+<div class="pager-bar muted">
+  <span>第 {{ page_no }} 页</span>
+  <span class="pager-links">
+    {% if has_prev and prev_cursor %}
+    <a href="{{ url_for('main.index', dir='prev', pg=page_no-1,
+        c_pending=prev_cursor.pending, c_form=prev_cursor.form, epoch=epoch) }}">← 上一页</a>
+    {% else %}<span class="pager-disabled">← 上一页</span>{% endif %}
+    <a href="{{ url_for('main.index') }}">回首页</a>
+    {% if has_next and next_cursor %}
+    <a href="{{ url_for('main.index', dir='next', pg=page_no+1,
+        c_pending=next_cursor.pending, c_form=next_cursor.form, epoch=epoch) }}">下一页 →</a>
+    {% else %}<span class="pager-disabled">下一页 →</span>{% endif %}
+  </span>
+</div>
+{% endif %}
 {% endblock %}

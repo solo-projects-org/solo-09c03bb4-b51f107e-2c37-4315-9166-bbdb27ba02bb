@@ -12,9 +12,37 @@ import sqlite3
 from datetime import datetime
 from typing import Iterable, Optional
 
+# 总览每页最多 50 单（需求上限）
+PAGE_SIZE = 50
+
 
 def _now() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+# ---------------------------------------------------------------- 待补状态与翻页版本
+def refresh_pending(conn: sqlite3.Connection, form_ids: Iterable[str]) -> bool:
+    """按“是否存在生效配对”重算指定单的待补标记，在当前事务内更新。
+
+    返回待补集合是否发生净变化（有单真正在 待补/已采信 之间切换）。
+    """
+    changed = False
+    for form_id in dict.fromkeys(form_ids):  # 去重并保持顺序
+        new_pending = 0 if active_pairing(conn, form_id) is not None else 1
+        cur = conn.execute(
+            "UPDATE forms SET pending = ? WHERE form_id = ? AND pending <> ?",
+            (new_pending, form_id, new_pending),
+        )
+        if cur.rowcount > 0:
+            changed = True
+    return changed
+
+
+def bump_pagination_epoch(conn: sqlite3.Connection) -> None:
+    """推进翻页版本号：仅在新单入册或待补集合净变化时调用。"""
+    conn.execute(
+        "UPDATE overview_meta SET pagination_epoch = pagination_epoch + 1 WHERE id = 1"
+    )
 
 
 # ---------------------------------------------------------------- 基础查询
@@ -120,8 +148,11 @@ def import_forms(conn: sqlite3.Connection, raw: str) -> dict:
     }
     added = [f for f in cleaned if f not in existing]
     conn.executemany(
-        "INSERT INTO forms (form_id) VALUES (?)", [(f,) for f in added]
+        "INSERT INTO forms (form_id, pending) VALUES (?, 1)", [(f,) for f in added]
     )
+    if added:
+        # 新单入册：旧翻页位置必然失效，推进翻页版本号
+        bump_pagination_epoch(conn)
     return {
         "added": added,
         "existing": [f for f in cleaned if f in existing],
@@ -201,6 +232,11 @@ def import_reports(conn: sqlite3.Connection, rows: Iterable[dict]) -> dict:
     for form_id in touched_forms:
         pairing = attempt_pair(conn, form_id)
         (paired if pairing is not None else pending).append(form_id)
+
+    # 待补标记随配对结果同事务更新；只有待补集合发生净变化才推进翻页版本。
+    # 仅换报告号、只增删报告计数而未进出待补时，深页位置仍然有效，不推进。
+    if refresh_pending(conn, touched_forms):
+        bump_pagination_epoch(conn)
 
     conn.commit()
     return {
@@ -292,6 +328,9 @@ def invalidate_batch(conn: sqlite3.Connection, batch_id: str, note: str = "") ->
             "rebuilt_pairings, note) VALUES (?, ?, ?, ?, ?, ?)",
             (batch_id, now, len(affected_forms), retained, rebuilt, note or None),
         )
+        # 作废导致配对解体/重建：同事务校准待补标记；待补集合净变化才推进翻页版本
+        if refresh_pending(conn, affected_forms):
+            bump_pagination_epoch(conn)
         conn.commit()
         invalidation = conn.execute(
             "SELECT * FROM batch_invalidations WHERE id = ?", (cur.lastrowid,)
@@ -308,12 +347,19 @@ def invalidate_batch(conn: sqlite3.Connection, batch_id: str, note: str = "") ->
 
 
 # ---------------------------------------------------------------- 页面查询
-def forms_overview(conn: sqlite3.Connection) -> list[sqlite3.Row]:
-    """每个采样单的入档/配对/重核状态。"""
+def overview_stats(conn: sqlite3.Connection) -> sqlite3.Row:
+    """页首四项全库统计：直接读触发器维护的单行元数据，O(1)，不逐单重算。"""
     return conn.execute(
-        """
+        "SELECT total_forms, paired_forms, pending_forms, open_rechecks, "
+        "pagination_epoch FROM overview_meta WHERE id = 1"
+    ).fetchone()
+
+
+def _overview_select() -> str:
+    return """
         SELECT f.form_id,
                f.created_at,
+               f.pending,
                (SELECT COUNT(*) FROM reports r WHERE r.form_id = f.form_id) AS total_reports,
                (SELECT COUNT(*) FROM reports r WHERE r.form_id = f.form_id AND r.valid = 1) AS valid_reports,
                (SELECT COUNT(*) FROM recheck_entries e
@@ -322,9 +368,66 @@ def forms_overview(conn: sqlite3.Connection) -> list[sqlite3.Row]:
                p.report_a_id, p.report_b_id, p.created_at AS paired_at
         FROM forms f
         LEFT JOIN pairings p ON p.form_id = f.form_id AND p.dissolved_at IS NULL
-        ORDER BY (p.id IS NULL) DESC, f.form_id
-        """
+    """
+
+
+def forms_overview(conn: sqlite3.Connection) -> list[sqlite3.Row]:
+    """每个采样单的入档/配对/重核状态（全量，顺序与总览一致：待补在前、组内单号）。"""
+    return conn.execute(
+        _overview_select() + " ORDER BY f.pending DESC, f.form_id ASC"
     ).fetchall()
+
+
+def _cursor_where(forward: bool) -> str:
+    """键集游标配位：排序为 (pending DESC, form_id ASC)。
+
+    游标 (cp, cf) 之后（forward）的行：pending 更小，或 pending 相同而 form_id 更大；
+    游标之前（backward）的行：pending 更大，或 pending 相同而 form_id 更小。
+    三个 ? 依次绑定 (cp, cp, cf)；展开显式比较，兼容旧版 SQLite，不用行值语法。
+    """
+    if forward:
+        return "((f.pending < ?) OR (f.pending = ? AND f.form_id > ?))"
+    return "((f.pending > ?) OR (f.pending = ? AND f.form_id < ?))"
+
+
+def overview_page(
+    conn: sqlite3.Connection,
+    direction: str = "next",
+    cursor_pending: Optional[int] = None,
+    cursor_form: Optional[str] = None,
+    page_size: int = PAGE_SIZE,
+) -> dict:
+    """键集分页取一页明细，不使用 OFFSET：翻到深页也不扫过前面的单。
+
+    - direction=next：取游标之后（首页 cursor 为空）；
+    - direction=prev：取游标之前的最后一页，返回前翻转为正序。
+    多取 1 条用于判断是否还有下一页，不额外发 COUNT 查询。
+    """
+    limit = page_size + 1
+    sql = _overview_select()
+    params: list = []
+
+    if cursor_pending is not None and cursor_form is not None:
+        forward = direction != "prev"
+        sql += " WHERE " + _cursor_where(forward)
+        # 三个 ? 的绑定顺序：pending 比较值、pending 等值、form_id 比较值
+        params = [int(cursor_pending), int(cursor_pending), str(cursor_form)]
+    else:
+        forward = True
+
+    if forward:
+        sql += " ORDER BY f.pending DESC, f.form_id ASC LIMIT ?"
+    else:
+        sql += " ORDER BY f.pending ASC, f.form_id DESC LIMIT ?"
+    params.append(limit)
+
+    rows = conn.execute(sql, params).fetchall()
+    has_more = len(rows) > page_size
+    if has_more:
+        rows = rows[:page_size]
+    if not forward:
+        rows = list(reversed(rows))
+    return {"rows": rows, "has_more": has_more}
 
 
 def form_detail(conn: sqlite3.Connection, form_id: str) -> Optional[dict]:

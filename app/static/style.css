@@ -45,3 +45,11 @@ button:hover { background: #2a6496; }
 .file-label { font-weight: bold; display: block; margin-bottom: 8px; }
 code { background: #eef1f5; padding: 1px 6px; border-radius: 4px; }
 a { color: #1f4e79; }
+.pager-bar { display: flex; justify-content: space-between; align-items: center;
+  background: #fff; border: 1px solid #dcdfe6; border-radius: 8px; padding: 10px 14px;
+  margin: 12px 0; font-size: 13px; }
+.pager-links a { margin-left: 14px; text-decoration: none; font-weight: bold; }
+.pager-links a:hover { text-decoration: underline; }
+.pager-disabled { margin-left: 14px; color: #c0ccda; }
+.stale-notice { font-size: 14px; padding: 16px 18px; }
+.stale-home { font-weight: bold; }

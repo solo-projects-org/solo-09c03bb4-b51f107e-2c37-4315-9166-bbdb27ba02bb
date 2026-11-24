@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
-"""两个需求场景的端到端试跑：
+"""三个需求场景的端到端试跑：
   A. 作废换证：整批作废 -> 原配对解体/保留 -> 幸存者优先重建 -> 该批新报告拒收
   B. 交错入档：重核期间名单照常查询，其他批报告交错续传、自动核销
+  C. 总览分页：每页最多 50、待补在前、键集翻页不扫全库、翻页版本失效提示
 用法：python3 scripts/demo_scenarios.py [数据库路径]（默认 data/demo.db，自动重建）
 """
 import os
@@ -143,6 +144,66 @@ def scenario_b_interleaved_archiving(conn):
     assert not services.open_rechecks(conn)
 
 
+def scenario_c_pagination(conn):
+    """场景 C：总览分页——每页最多 50、待补在前、键集翻页不扫全库、版本失效提示。"""
+    print("\n" + "=" * 70)
+    print("场景 C：总览键集分页（130 单，前 40 单已采信、90 单待补）")
+    print("=" * 70)
+    ids = [f"P-{i:05d}" for i in range(130)]
+    services.import_forms(conn, "\n".join(ids))
+    conn.commit()
+    for fid in ids[:40]:
+        services.import_reports(conn, [
+            rep(fid, fid + "-A", "B1", "LAB-A", "BAT-P1"),
+            rep(fid, fid + "-B", "B2", "LAB-B", "BAT-P1"),
+        ])
+
+    meta = services.overview_stats(conn)
+    print(f"\n>> 页首统计（读单行元数据，O(1)）：应复核 {meta['total_forms']} / "
+          f"已采信 {meta['paired_forms']} / 待补 {meta['pending_forms']} / "
+          f"重核中 {meta['open_rechecks']}；当前翻页版本 epoch={meta['pagination_epoch']}")
+
+    print(">> 跟随游标翻页（无 OFFSET，深页不扫前面的单）：")
+    seen, cp, cf, page_no = [], None, None, 0
+    while True:
+        pg = services.overview_page(conn, "next", cp, cf)
+        rows = pg["rows"]
+        page_no += 1
+        n_pending = sum(1 for r in rows if r["pending"] == 1)
+        n_paired = len(rows) - n_pending
+        label = f"待补 {n_pending}" + (f"、已采信 {n_paired}" if n_paired else "")
+        print(f"   第 {page_no} 页：{len(rows)} 单（{label}）"
+              f"  首 {rows[0]['form_id']} … 尾 {rows[-1]['form_id']}")
+        seen.extend(r["form_id"] for r in rows)
+        if not pg["has_more"]:
+            break
+        cp, cf = rows[-1]["pending"], rows[-1]["form_id"]
+    # 分页覆盖的是全表：拼接顺序必须与总览全量顺序逐单一致（含前两个场景的单）
+    full_all = [r["form_id"] for r in services.forms_overview(conn)]
+    assert seen == full_all, "翻页拼接顺序必须与总览全量顺序一致"
+    p_ids = {fid for fid in full_all if fid.startswith("P-")}
+    assert len(p_ids) == 130 and p_ids.issubset(set(seen))
+    print(f"   共 {page_no} 页、{len(seen)} 单，无重复无遗漏；"
+          f"待补组全部排在已采信组之前，本场景 130 单均在其中。")
+
+    # 只改计数、不进出待补 -> epoch 不变，深页链接继续有效
+    before = services.overview_stats(conn)["pagination_epoch"]
+    services.import_reports(conn, [rep(ids[-1], "R-ONLY", "B9", "LAB-Z", "BAT-P2")])
+    after = services.overview_stats(conn)["pagination_epoch"]
+    print(f"\n>> 给待补单 {ids[-1]} 加一份不构成配对的报告：epoch {before} -> {after}"
+          f"（{'不变，深页照常翻' if before == after else '异常！'}）")
+
+    # 新单入册 -> epoch 推进，旧链接应被判定失效
+    before = services.overview_stats(conn)["pagination_epoch"]
+    services.import_forms(conn, "P-NEW")
+    conn.commit()
+    after = services.overview_stats(conn)["pagination_epoch"]
+    stale = before != after
+    print(f">> 新单 P-NEW 入册：epoch {before} -> {after}；"
+          f"携带旧 epoch 的深页链接会被总览页拦下，提示回首页：{stale}")
+    assert stale
+
+
 def main():
     db_path = sys.argv[1] if len(sys.argv) > 1 else os.path.join(
         os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data", "demo.db")
@@ -159,7 +220,8 @@ def main():
         conn = get_db()
         scenario_a_invalidate_and_replace(conn)
         scenario_b_interleaved_archiving(conn)
-    print("\n两个场景试跑全部通过 ✔")
+        scenario_c_pagination(conn)
+    print("\n三个场景试跑全部通过 ✔")
 
 
 if __name__ == "__main__":

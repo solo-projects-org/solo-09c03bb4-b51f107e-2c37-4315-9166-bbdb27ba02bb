@@ -20,15 +20,94 @@ bp = Blueprint("main", __name__)
 
 @bp.route("/")
 def index():
+    """采样单总览：键集分页（每页最多 50 单，待补在前、组内按单号）。
+
+    - 页首四项全库统计读触发器维护的元数据，不逐单重算；
+    - 统计与当页明细在同一只读事务（同一已提交快照）内读取；
+    - 翻页链接带入册时的 pagination_epoch；若期间有新单入册或待补集合进出，
+      则版本不一致，提示回首页，不沿旧位置继续翻。
+    """
     conn = get_db()
-    forms = services.forms_overview(conn)
-    stats = {
-        "total_forms": len(forms),
-        "paired": sum(1 for f in forms if f["pairing_id"] is not None),
-        "pending": sum(1 for f in forms if f["pairing_id"] is None),
-        "open_rechecks": len(services.open_rechecks(conn)),
-    }
-    return render_template("index.html", forms=forms, stats=stats)
+    direction = request.args.get("dir", "next")
+    if direction not in ("next", "prev"):
+        direction = "next"
+    pg_arg = request.args.get("pg", "1")
+    try:
+        page_no = max(1, int(pg_arg))
+    except (TypeError, ValueError):
+        page_no = 1
+
+    cursor_pending = None
+    cursor_form = None
+    if "c_pending" in request.args and "c_form" in request.args:
+        try:
+            cursor_pending = 1 if int(request.args["c_pending"]) == 1 else 0
+        except (TypeError, ValueError):
+            cursor_pending = None
+        cursor_form = (request.args["c_form"] or "").strip() or None
+        if cursor_form is None:
+            cursor_pending = None
+
+    try:
+        epoch_arg = int(request.args.get("epoch", ""))
+    except (TypeError, ValueError):
+        epoch_arg = None
+
+    has_cursor = cursor_pending is not None and cursor_form is not None
+    # 仅在“携带游标翻深页且 epoch 已变”时判定失效；首页（无游标）永远渲染最新状态
+    stale = has_cursor and epoch_arg is not None
+
+    # 只读事务：统计与明细取自同一个已提交快照，期间提交的写入不影响本页
+    conn.execute("BEGIN DEFERRED")
+    try:
+        meta = services.overview_stats(conn)
+        current_epoch = meta["pagination_epoch"]
+        stats = {
+            "total_forms": meta["total_forms"],
+            "paired": meta["paired_forms"],
+            "pending": meta["pending_forms"],
+            "open_rechecks": meta["open_rechecks"],
+        }
+
+        stale = stale and epoch_arg != current_epoch
+        if stale:
+            # 数据已变（新单入册或待补进出）：不取旧位置明细，提示回首页
+            page = {"rows": [], "has_more": False}
+        else:
+            page = services.overview_page(
+                conn,
+                direction=direction,
+                cursor_pending=cursor_pending if has_cursor else None,
+                cursor_form=cursor_form if has_cursor else None,
+            )
+    finally:
+        conn.commit()  # 结束只读事务（无写入，commit 仅释放快照）
+
+    forms = page["rows"]
+    has_next = page["has_more"]
+    has_prev = page_no > 1
+
+    # 翻页游标：下一页用本页最后一单，上一页用本页第一单
+    next_cursor = prev_cursor = None
+    if forms:
+        last = forms[-1]
+        next_cursor = {"pending": last["pending"], "form": last["form_id"]}
+        first = forms[0]
+        prev_cursor = {"pending": first["pending"], "form": first["form_id"]}
+
+    return render_template(
+        "index.html",
+        forms=forms,
+        stats=stats,
+        page_no=page_no,
+        epoch=current_epoch,
+        stale=stale,
+        has_next=has_next,
+        has_prev=has_prev,
+        next_cursor=next_cursor,
+        prev_cursor=prev_cursor,
+        page_size=services.PAGE_SIZE,
+    )
 
 
 @bp.route("/forms/import", methods=["GET", "POST"])
